@@ -1,0 +1,2776 @@
+---
+title: "00.Source_HS_Samples"
+output: html_document
+date: "2026-09-15"
+---
+
+```{r}
+libs <- c("tidyverse", "here", "reshape2", "dplyr", "ggplot2", "vegan")
+
+lapply(libs, library, character.only = T)
+
+# ============================================================
+# INPUT FILES AND WORKSHEETS
+# ============================================================
+# Update these inputs for another project with the same table structure.
+abundance_path <- here::here("data_raw", "MCO_ASV_abundance_table.csv")
+taxonomy_path <- here::here("data_raw", "MCO_LCA_taxonomy.csv")
+metadata_path <- here::here("data_raw", "HS metadata.xlsx")
+
+spider_sheet <- "HS spider"
+web_sheet <- "HS web"
+abdomen_sheet <- "HS abdomen"
+asv_prefix <- "MCO_ASV_"
+
+# ============================================================
+# QUALITY-CONTROL SETTINGS
+
+# Overall goal: retain biological samples and ASVs with
+# sufficient read support, while removing weak detections
+# and potential contamination.
+#
+# 1. min_cell_reads: Set low ASV read counts within
+#    individual samples to zero.
+# 2. min_sample_reads: Exclude biological samples with
+#    insufficient total reads.
+# 3. blank_asv_threshold: Identify ASVs with high read
+#    counts in the negative-control blank for removal.
+# 4. min_total_asv_reads: Exclude ASVs with insufficient
+#    total reads across the retained biological samples.
+#
+# blank_pattern matches the shared blank naming format,
+# ignoring case. Use the same pattern throughout the project.
+# ============================================================
+
+min_cell_reads <- 10
+min_sample_reads <- 10000
+blank_asv_threshold <- 100
+min_total_asv_reads <- 100
+blank_pattern <- "blank"
+
+# ============================================================
+# PLOT AND TEST SETTINGS
+# ============================================================
+# Number of named families shown separately; display grouping only.
+number_of_top_families <- 25
+# Spacing of rarefaction plotting points, not a filtering threshold.
+rarefaction_step <- 500
+# Maximum random starts; the main NMDS remains two-dimensional.
+nmds_trymax <- 1000
+# Reproducible NMDS fits and permutation tests.
+analysis_seed <- 123
+n_permutations <- 9999
+# Formal group tests only; singleton groups remain in descriptive plots.
+min_group_samples <- 2
+# Run pairwise follow-up only when the overall PERMANOVA passes this level.
+test_alpha <- 0.05
+```
+```{r}
+# ===============================
+# ABUNDANCE TABLE PROCESSING
+# ===============================
+# -------------------------------
+# Read MCO abundance table
+# -------------------------------
+
+mco_HS <- read.csv(
+  abundance_path,
+  header = TRUE,
+  stringsAsFactors = FALSE,
+  check.names = FALSE
+)
+
+# Remove the sequencing suffix, e.g. _S385_L001_A_MCO.
+mco_HS$SampleID <- gsub(
+  "_S[0-9]+_L[0-9]+_[A-Z]_MCO$",
+  "",
+  mco_HS$SampleID
+)
+
+# Remove the trailing molecular ID, e.g. _M007143.
+mco_HS$SampleID <- gsub(
+  "_M[0-9]+$",
+  "",
+  mco_HS$SampleID
+)
+
+names(mco_HS)[names(mco_HS) == "SampleID"] <- "sample_id"
+
+# ============================================================
+# STEP 1: MERGE A/B/C SEQUENCING RECORDS
+# ============================================================
+#
+# Each biological sample has three technical sequencing
+# records: A, B, and C.
+#
+# Records with the same cleaned sample_id are grouped, and
+# their MCO ASV read counts are summed.
+#
+# Output: one row per biological sample or blank.
+# ============================================================
+
+mco_HS_combined <- mco_HS %>%
+  group_by(sample_id) %>%
+  summarise(
+    across(
+      starts_with(asv_prefix),
+      ~sum(.x, na.rm = TRUE)
+    ),
+    .groups = "drop"
+  )
+
+# Identify blanks once from the cleaned, merged sample IDs.
+blank_sample_ids <- mco_HS_combined$sample_id[
+  str_detect(
+    mco_HS_combined$sample_id,
+    regex(blank_pattern, ignore_case = TRUE)
+  )
+]
+
+
+# ============================================================
+# STEP 2: REMOVE INDIVIDUAL ASV COUNTS BELOW 10 READS
+# ============================================================
+#
+# Read counts below min_cell_reads are treated as low-count
+# noise and converted to zero.
+#
+# This changes cell values but does not remove any samples
+# or ASV columns.
+# ============================================================
+
+mco_HS_min10 <- mco_HS_combined %>%
+  mutate(
+    across(
+      starts_with(asv_prefix),
+      ~ifelse(.x < min_cell_reads, 0, .x)
+    )
+  )
+
+
+# ============================================================
+# STEP 3: CALCULATE TOTAL READS PER SAMPLE
+# ============================================================
+#
+# Sample sequencing depth is recalculated after low-count
+# ASV values have been converted to zero.
+#
+# sample_total_reads contains the sum of all remaining ASV
+# reads in each sample.
+# ============================================================
+
+mco_HS_with_depth <- mco_HS_min10 %>%
+  mutate(
+    sample_total_reads = rowSums(
+      across(starts_with(asv_prefix)),
+      na.rm = TRUE
+    )
+  )
+
+
+# ============================================================
+# STEP 4: REMOVE LOW-DEPTH BIOLOGICAL SAMPLES
+# ============================================================
+#
+# Biological samples must contain more than
+# min_sample_reads total reads after low-count filtering.
+# Later ASV and taxonomy filters can reduce this total;
+# the sample-depth cutoff is not applied again.
+#
+# The HS blank is deliberately retained through this step
+# so it can be used for contamination detection.
+# ============================================================
+
+mco_HS_depth_filtered <- mco_HS_with_depth %>%
+  filter(
+    sample_total_reads > min_sample_reads |
+      sample_id %in% blank_sample_ids
+  )
+
+
+# ============================================================
+# STEP 5: EXTRACT THE HS BLANK SAMPLE
+# ============================================================
+#
+# The blank is separated from the biological samples so its
+# ASV reads can be examined for possible contamination.
+#
+# sample_total_reads is removed because only the individual
+# ASV counts are needed for contamination detection.
+# ============================================================
+
+blank_HS <- mco_HS_depth_filtered %>%
+  filter(sample_id %in% blank_sample_ids) %>%
+  select(-sample_total_reads)
+
+
+# ============================================================
+# STEP 6: IDENTIFY BLANK-ASSOCIATED ASVs
+# ============================================================
+#
+# The blank table is converted from wide to long format.
+#
+# Reads are summed for each ASV across all blank samples.
+# Although HS currently has one blank, this code also works
+# if additional blanks are added later.
+#
+# ASVs with more than blank_asv_threshold reads in the
+# blanks are classified as blank-associated ASVs.
+# ============================================================
+
+blank_asv_counts <- blank_HS %>%
+  pivot_longer(
+    cols = starts_with(asv_prefix),
+    names_to = "query",
+    values_to = "value"
+  ) %>%
+  group_by(query) %>%
+  summarise(
+    total_blank_reads = sum(value, na.rm = TRUE),
+    .groups = "drop"
+  ) %>%
+  filter(total_blank_reads > blank_asv_threshold)
+
+blank_asvs <- blank_asv_counts$query
+
+
+# ============================================================
+# STEP 7: REMOVE THE BLANK AND BLANK-ASSOCIATED ASVs
+# ============================================================
+#
+# The blank has now been used for contamination detection
+# and is removed from the biological dataset.
+#
+# ASV columns identified as blank-associated are also
+# removed. any_of() allows the code to work even when no
+# ASVs exceed the blank threshold.
+# ============================================================
+
+mco_HS_no_blank <- mco_HS_depth_filtered %>%
+  filter(!sample_id %in% blank_sample_ids) %>%
+  select(
+    -sample_total_reads,
+    -any_of(blank_asvs)
+  )
+
+
+# ============================================================
+# STEP 8: CONVERT TO ASV-BY-SAMPLE FORMAT
+# ============================================================
+#
+# The table currently has samples as rows and ASVs as
+# columns.
+#
+# It is reshaped so that:
+#   rows    = ASVs
+#   columns = biological samples
+#   values  = read counts
+#
+# query stores the ASV identifier and will later be used to
+# merge the abundance and taxonomy tables.
+# ============================================================
+
+mco_HS_asv_by_sample <- mco_HS_no_blank %>%
+  pivot_longer(
+    cols = starts_with(asv_prefix),
+    names_to = "query",
+    values_to = "value"
+  ) %>%
+  pivot_wider(
+    names_from = sample_id,
+    values_from = value
+  )
+
+
+# ============================================================
+# STEP 9: APPLY THE FINAL ASV READ FILTER
+# ============================================================
+#
+# Total reads are calculated for each ASV across all
+# remaining biological samples.
+#
+# Only ASVs with more than min_total_asv_reads are retained.
+# The resulting table is ready to merge with taxonomy using
+# the query column.
+# ============================================================
+
+mco_HS_final <- mco_HS_asv_by_sample %>%
+  mutate(
+    asv_total_reads = rowSums(
+      dplyr::select(., -query),
+      na.rm = TRUE
+    )
+  ) %>%
+  filter(asv_total_reads > min_total_asv_reads) %>%
+  select(
+    query,
+    asv_total_reads,
+    everything()
+  )
+```
+
+```{r}
+# ============================================================
+# TAXONOMIC TABLE PROCESSING
+# ============================================================
+
+mco_HS_tax <- read.csv(
+  taxonomy_path,
+  header = TRUE,
+  sep = ",",
+  stringsAsFactors = FALSE
+)
+
+
+# ============================================================
+# FILTER TAXONOMIC ASSIGNMENTS
+# ============================================================
+#
+# Length screening was completed upstream.
+# Retain ASVs with Best_Identity >= 90.
+# ============================================================
+# Retain Arthropoda at the confirmed identity threshold.
+# Preserve the original workflow's requirement for a
+# non-missing Class assignment.
+mco_HS_tax2 <- mco_HS_tax %>%
+  filter(
+    Best_Identity >= 90,
+    Kingdom == "Metazoa",
+    Phylum == "Arthropoda",
+    !is.na(Class),
+    Class != "Nan"
+  )
+# ============================================================
+# APPLY TAXONOMIC CONFIDENCE THRESHOLDS
+# ============================================================
+#
+# More specific taxonomic ranks require greater sequence
+# identity:
+#
+#   Species: Best_Identity >= 98.5
+#   Genus:   Best_Identity >= 95
+#   Family:  Best_Identity >= 90
+#
+# These are the project's assignment thresholds.
+# Labels below their rank's threshold are replaced with NA;
+# this step does not remove ASVs.
+# ============================================================
+
+mco_HS_tax_final <- mco_HS_tax2 %>%
+  mutate(
+    Species = case_when(
+      Best_Identity >= 98.5 ~ Species,
+      TRUE ~ NA_character_
+    ),
+
+    Genus = case_when(
+      Best_Identity >= 95 ~ Genus,
+      TRUE ~ NA_character_
+    ),
+
+    Family = case_when(
+      Best_Identity >= 90 ~ Family,
+      TRUE ~ NA_character_
+    )
+  ) %>%
+
+  # If species-level identification is unavailable but the
+  # genus assignment is reliable, label it as "Genus sp".
+  mutate(
+    Species = ifelse(
+      is.na(Species) & !is.na(Genus),
+      paste(Genus, "sp"),
+      Species
+    )
+  )
+
+
+# ============================================================
+# STANDARDIZE THE ASV IDENTIFIER
+# ============================================================
+#
+# ASV_ID in the taxonomy table corresponds to query in the
+# filtered abundance table.
+# ============================================================
+
+names(mco_HS_tax_final)[
+  names(mco_HS_tax_final) == "ASV_ID"
+] <- "query"
+
+
+# ============================================================
+# MERGE TAXONOMY WITH FILTERED ABUNDANCE
+# ============================================================
+#
+# Only ASVs present in both the filtered taxonomy table and
+# the filtered abundance table are retained.
+# ============================================================
+
+mco_HS_final_tax <- merge(
+  mco_HS_tax_final,
+  mco_HS_final,
+  by = "query"
+)
+
+```
+
+```{r filtering_summary_plot, fig.width=12, fig.height=10}
+# ============================================================
+# FILTERING WORKFLOW SUMMARY
+# ============================================================
+#
+# This section summarizes data retained after each major
+# filtering stage.
+#
+# The figure contains separate panels for samples, ASVs,
+# and reads because these quantities have very different
+# scales.
+# ============================================================
+
+
+# Calculate total ASV reads in a sample-by-ASV table.
+sum_asv_reads <- function(data) {
+
+  asv_columns <- names(data)[
+    startsWith(names(data), asv_prefix)
+  ]
+
+  sum(
+    as.matrix(data[, asv_columns, drop = FALSE]),
+    na.rm = TRUE
+  )
+}
+
+# Count ASVs with at least one non-zero read after each filtering step.
+count_detected_asvs <- function(data) {
+  asv_columns <- names(data)[startsWith(names(data), asv_prefix)]
+
+  sum(
+    colSums(
+      as.matrix(data[, asv_columns, drop = FALSE]),
+      na.rm = TRUE
+    ) > 0
+  )
+}
+
+# Use the same stages for all three measurements.
+workflow_stages <- c(
+  "Initial data",
+  "A/B/C records merged",
+  "Counts below 10 set to zero",
+  "Low-depth samples removed",
+  "Blank and blank ASVs removed",
+  "Low-total ASVs removed",
+  "Taxonomy filtered and matched"
+)
+
+
+# Record the amount of data remaining after each stage.
+filtering_summary <- bind_rows(
+
+  tibble(
+    metric = "Samples",
+    stage = workflow_stages,
+    remaining = c(
+      n_distinct(mco_HS$sample_id),
+      nrow(mco_HS_combined),
+      nrow(mco_HS_min10),
+      nrow(mco_HS_depth_filtered),
+      nrow(mco_HS_no_blank),
+      nrow(mco_HS_no_blank),
+      nrow(mco_HS_no_blank)
+    )
+  ),
+
+tibble(
+  metric = "ASVs",
+  stage = workflow_stages,
+  remaining = c(
+    count_detected_asvs(mco_HS),
+    count_detected_asvs(mco_HS_combined),
+    count_detected_asvs(mco_HS_min10),
+    count_detected_asvs(mco_HS_depth_filtered),
+    count_detected_asvs(mco_HS_no_blank),
+    nrow(mco_HS_final),
+    nrow(mco_HS_final_tax)
+  )
+),
+
+  tibble(
+    metric = "Reads",
+    stage = workflow_stages,
+    remaining = c(
+      sum_asv_reads(mco_HS),
+      sum_asv_reads(mco_HS_combined),
+      sum_asv_reads(mco_HS_min10),
+      sum_asv_reads(mco_HS_depth_filtered),
+      sum_asv_reads(mco_HS_no_blank),
+      sum(mco_HS_final$asv_total_reads, na.rm = TRUE),
+      sum(mco_HS_final_tax$asv_total_reads, na.rm = TRUE)
+    )
+  )
+) %>%
+
+  mutate(
+    metric = factor(
+      metric,
+      levels = c("Samples", "ASVs", "Reads")
+    ),
+    stage = factor(
+      stage,
+      levels = workflow_stages
+    )
+  ) %>%
+
+  arrange(metric, stage) %>%
+
+  group_by(metric) %>%
+
+  mutate(
+    previous = lag(remaining),
+    removed = ifelse(
+      is.na(previous),
+      0,
+      previous - remaining
+    ),
+
+    plot_label = ifelse(
+      removed > 0,
+      paste0(
+        scales::comma(remaining),
+        "\n(-",
+        scales::comma(removed),
+        ")"
+      ),
+      scales::comma(remaining)
+    )
+  ) %>%
+
+  ungroup() %>%
+  select(-previous)
+
+
+print(filtering_summary, n = Inf, width = Inf)
+
+
+# Create one summary visualization.
+# Plot retained samples, ASVs, and reads in separate panels.
+data_loss_plot <- ggplot(
+  filtering_summary,
+  aes(x = stage, y = remaining, fill = metric)
+) +
+  # Bar heights represent the amount of data remaining.
+  geom_col(width = 0.72) +
+
+  # Display retained counts and losses above each bar.
+  geom_text(
+    aes(label = plot_label),
+    vjust = -0.25,
+    size = 3.2,
+    lineheight = 0.95
+  ) +
+
+  # Stack the three panels vertically.
+  # Each panel has its own y-axis scale.
+  facet_wrap(
+    ~ metric,
+    ncol = 1,
+    scales = "free_y"
+  ) +
+
+  scale_fill_manual(
+    values = c(
+      "Samples" = "#2C7FB8",
+      "ASVs" = "#31A354",
+      "Reads" = "#756BB1"
+    )
+  ) +
+
+  # Wrap long stage names onto multiple lines.
+  scale_x_discrete(
+    labels = function(x) stringr::str_wrap(x, width = 18)
+  ) +
+
+  # Reduce tick density and reserve space above the bars.
+  scale_y_continuous(
+    labels = scales::label_comma(),
+    breaks = scales::breaks_pretty(n = 3),
+    expand = expansion(mult = c(0, 0.45))
+  ) +
+
+  labs(
+    title = "Data retained across the HS MCO filtering workflow",
+    subtitle = paste(
+      "Labels show data remaining;",
+      "values in parentheses show loss from the previous stage."
+    ),
+    x = NULL,
+    y = "Data remaining",
+    caption = paste(
+      "Initial sample count represents unique cleaned sample IDs.",
+      "A/B/C sequencing records are treated as technical records.",
+      "Sample counts include blanks until blank removal.",
+      sep = "\n"
+    )
+  ) +
+
+  theme_bw(base_size = 11) +
+
+  theme(
+    legend.position = "none",
+
+    axis.text.x = element_text(
+      angle = 0,
+      hjust = 0.5,
+      size = 9
+    ),
+
+    panel.grid.minor = element_blank(),
+    panel.grid.major.x = element_blank(),
+
+    panel.spacing.y = grid::unit(0.8, "cm"),
+
+    strip.text = element_text(
+      face = "bold",
+      size = 12
+    ),
+
+    plot.title = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(size = 10),
+    plot.caption = element_text(hjust = 0, size = 9)
+  )
+
+data_loss_plot
+
+``` 
+
+
+
+
+
+
+```{r}
+# ============================================================
+#install.packages("openxlsx")   # Run once
+library(openxlsx)
+# ============================================================
+# READ METADATA FOR THE WEB ANALYSIS
+# ============================================================
+# HS spider provides host-spider identification.
+# HS web provides the biological IDs associated with web samples.
+# Keep the raw metadata tables unchanged; prepare analysis tables below.
+
+# Read each worksheet as a separate table. Keep as raw input.
+hs_spider_raw  <- openxlsx::read.xlsx(metadata_path, sheet = spider_sheet)
+hs_web_raw     <- openxlsx::read.xlsx(metadata_path, sheet = web_sheet)
+hs_abdomen_raw <- openxlsx::read.xlsx(metadata_path, sheet = abdomen_sheet)
+
+```
+
+```{r}
+# ============================================================
+# PREPARE HOST SPIDER IDENTITY TABLE
+# ============================================================
+# Input:
+#   Raw host-spider records from the "HS spider" worksheet.
+#
+# Output:
+#   spider_identity
+#   One row per biological spider.
+#
+# This table stores the host spider identity used to group
+# web samples in the downstream analysis.
+# Retain morphological, molecular and tentative identifications.
+# ============================================================
+spider_identity <- hs_spider_raw %>%
+
+  transmute(
+
+    biological_id =
+      str_squish(as.character(Sample.ID)),
+
+    morphology_id =
+      na_if(
+        str_squish(as.character(Morphology.ID)),
+        ""
+      ),
+
+    molecular_id =
+      na_if(
+        str_squish(as.character(Molecular.ID)),
+        ""
+      ),
+
+    tentative_species_id =
+      na_if(
+        str_squish(as.character(Tentative.Species.ID)),
+        ""
+      )
+  ) %>%
+
+  filter(
+    str_detect(biological_id, "^HS[0-9]+$")
+  )
+
+```
+
+```{r}
+# ============================================================
+# PREPARE METADATA FOR QC-RETAINED WEB SAMPLES
+# ============================================================
+# The HS spider and HS web sheets share biological IDs.
+# Convert each biological ID to its web-sample ID:
+# HS1 -> hw1. Use the actual ID, not the row number.
+
+web_analysis_metadata <- spider_identity %>%
+  mutate(
+    sample_id = str_replace(biological_id, "^HS", "hw")
+  )
+
+# Keep the QC-retained sample set and attach host information.
+mco_HS_sample_metadata <- mco_HS_no_blank %>%
+  distinct(sample_id) %>%
+  left_join(
+    web_analysis_metadata,
+    by = "sample_id"
+  )
+
+```
+
+```{r}
+# ============================================================
+# CREATE THE ANALYSIS-READY LONG TABLE
+# ============================================================
+# Inputs:
+#   mco_HS_final_tax: one row per ASV, with samples in columns.
+#   mco_HS_sample_metadata: one row per QC-retained sample.
+#
+# Output:
+#   One row per sample–ASV combination, including zero reads.
+
+analysis_sample_ids <- mco_HS_sample_metadata$sample_id
+
+mco_HS_analysis_long <- mco_HS_final_tax %>%
+  pivot_longer(
+    cols = all_of(analysis_sample_ids),
+    names_to = "sample_id",
+    values_to = "reads"
+  ) %>%
+  left_join(
+    mco_HS_sample_metadata,
+    by = "sample_id"
+  )
+
+# Each sample–ASV combination must occur only once.
+stopifnot(
+  anyDuplicated(
+    mco_HS_analysis_long[c("sample_id", "query")]
+  ) == 0
+)
+
+# Summarize the final analysis dataset.
+analysis_table_summary <- mco_HS_analysis_long %>%
+  summarise(
+    number_of_rows = n(),
+    number_of_samples = n_distinct(sample_id),
+    number_of_asvs = n_distinct(query),
+    number_of_host_groups = n_distinct(tentative_species_id),
+    total_reads = sum(reads)
+  )
+
+print(analysis_table_summary, width = Inf)
+```
+
+```{r hs_plot_setup}
+# ============================================================
+# SHARED DATA PREPARATION FOR WEB-COMMUNITY PLOTS
+# ============================================================
+#
+# These plots describe the retained ASVs, not numbers of species or
+# organisms. Host groups use `tentative_species_id`. Read counts
+# reflect the sequencing data and must not be interpreted directly
+# as organism abundance.
+#
+# Create the sample-by-ASV matrix once. Metadata remains in a
+# separate table with one row per sample. The long table is retained
+# for taxonomic summaries.
+
+# ------------------------------------------------------------
+# REUSE THE FINAL LONG TABLE
+# ------------------------------------------------------------
+# Reuse the validated long table; do not apply another filter here.
+mco_HS_plot_data <- mco_HS_analysis_long
+
+# ------------------------------------------------------------
+# CREATE THE SAMPLE-BY-ASV MATRIX
+# ------------------------------------------------------------
+# Rows = samples; columns = ASVs; cells = retained integer read counts.
+community_wide <- mco_HS_plot_data %>%
+  select(sample_id, query, reads) %>%
+  pivot_wider(
+    names_from = query,
+    values_from = reads,
+    values_fill = 0
+  ) %>%
+  arrange(sample_id)
+
+community_matrix <- community_wide %>%
+  select(-sample_id) %>%
+  as.matrix()
+rownames(community_matrix) <- community_wide$sample_id
+
+# This protects the relative-abundance and distance calculations below.
+# Do not silently remove a sample that becomes empty after taxonomic filtering.
+stopifnot(all(rowSums(community_matrix) > 0))
+
+# ------------------------------------------------------------
+# PREPARE SAMPLE METADATA
+# ------------------------------------------------------------
+
+analysis_sample_metadata <- mco_HS_plot_data %>%
+  distinct(sample_id, biological_id, tentative_species_id)
+
+# ------------------------------------------------------------
+# DEFINE CONSISTENT HOST ORDER, COLORS AND LABELS
+# ------------------------------------------------------------
+# Count samples once. Order hosts by decreasing sample size, with
+# alphabetical ties. This order is shared by all host-group figures.
+host_sample_counts <- analysis_sample_metadata %>%
+  count(tentative_species_id, name = "number_of_samples") %>%
+  arrange(desc(number_of_samples), as.character(tentative_species_id))
+
+host_levels <- as.character(host_sample_counts$tentative_species_id)
+
+# Setting factor levels here also fixes facet and legend order after joins.
+analysis_sample_metadata <- analysis_sample_metadata %>%
+  mutate(
+    tentative_species_id = factor(tentative_species_id, levels = host_levels)
+  )
+
+host_sample_counts <- host_sample_counts %>%
+  mutate(
+    tentative_species_id = factor(tentative_species_id, levels = host_levels)
+  )
+
+host_colors <- setNames(
+  grDevices::hcl.colors(length(host_levels), palette = "Dark 3"),
+  host_levels
+)
+
+# Group-comparison labels show how many individual web samples contribute.
+host_labels <- setNames(
+  paste0(host_levels, " (n=", host_sample_counts$number_of_samples, ")"),
+  host_levels
+)
+
+# With coord_flip(), reverse the displayed x-axis limits so the canonical
+# host order reads top to bottom. Vertical plots read left to right;
+# facets and legends follow host_levels without this display reversal.
+
+# ------------------------------------------------------------
+# CALCULATE SAMPLE-LEVEL DIVERSITY
+# ------------------------------------------------------------
+# Observed richness counts positive ASV cells. Shannon uses natural logarithms
+# and the proportions of ASV reads within each sample.
+sample_alpha_diversity <- tibble(
+  sample_id = rownames(community_matrix),
+  retained_reads = as.numeric(rowSums(community_matrix)),
+  observed_asvs = as.numeric(vegan::specnumber(community_matrix)),
+  shannon_index = as.numeric(vegan::diversity(community_matrix, index = "shannon"))
+) %>%
+  left_join(analysis_sample_metadata, by = "sample_id")
+```
+
+### A. Sampling structure and coverage
+
+```{r hs_host_counts, fig.width=10, fig.height=6}
+# ============================================================
+# PLOT 1: NUMBER OF WEB SAMPLES PER HOST GROUP
+# ============================================================
+#
+# Main figure: sampling structure.
+#
+# Each bar counts web samples. This establishes how unevenly the
+# host groups were sampled; a longer bar does not imply greater
+# community diversity.
+
+# ------------------------------------------------------------
+# DRAW THE FIGURE
+# ------------------------------------------------------------
+host_sample_count_plot <- ggplot(
+  host_sample_counts,
+  aes(x = tentative_species_id, y = number_of_samples)
+) +
+  geom_col(
+    fill = "#257C9D",
+    width = 0.7
+  ) +
+  geom_text(
+    aes(label = number_of_samples),
+    hjust = -0.2
+  ) +
+  scale_x_discrete(
+    limits = rev(host_levels)
+  ) +
+  coord_flip() +
+  scale_y_continuous(
+    expand = expansion(mult = c(0, 0.15))
+  ) +
+  labs(
+    title = "Retained web samples by host-spider species",
+    x = "Tentative host-spider species",
+    y = "Number of web samples"
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid.major.y = element_blank()
+  )
+
+host_sample_count_plot
+```
+
+```{r hs_read_rarefaction, fig.width=12, fig.height=10}
+# ============================================================
+# PLOT 2: READ-BASED RAREFACTION CURVES
+# ============================================================
+#
+# Diagnostic figure: retained read-depth coverage.
+#
+# Each line is the expected number of retained ASVs in a random
+# subsample of reads from one web sample. The x-axis counts retained
+# Arthropoda reads, not original sequencing reads. No sample is
+# replaced by a rarefied sample here.
+#
+# The prior <10-cell-read and >100-total-ASV filters removed rare
+# detections. Therefore, these curves describe the filtered dataset
+# and can look flatter than curves before those filters. They cannot
+# establish completeness of the original biological community. A
+# vegan warning about missing singletons is expected for this
+# filtered input; do not interpret reads as animal counts.
+
+# step controls the spacing of calculated plotting points only.
+# It is not a filtering cutoff or a selected common rarefaction depth.
+# rarecurve includes the full observed read total as each curve's endpoint.
+
+# ------------------------------------------------------------
+# CALCULATE THE READ-BASED CURVES
+# ------------------------------------------------------------
+rarefaction_plot_data <- vegan::rarecurve(
+  community_matrix,
+  step = rarefaction_step,
+  tidy = TRUE
+) %>%
+  rename(sample_id = Site, sampled_reads = Sample, expected_asvs = Species) %>%
+  mutate(
+    sample_id = as.character(sample_id)
+  ) %>%
+  left_join(analysis_sample_metadata, by = "sample_id")
+
+# ------------------------------------------------------------
+# DRAW THE FIGURE
+# ------------------------------------------------------------
+rarefaction_plot <- ggplot(
+  rarefaction_plot_data,
+  aes(
+    x = sampled_reads,
+    y = expected_asvs,
+    group = sample_id,
+    color = tentative_species_id
+  )
+) +
+  geom_line(
+    linewidth = 0.5,
+    alpha = 0.75
+  ) +
+  facet_wrap(
+    ~ tentative_species_id,
+    ncol = 3
+  ) +
+  scale_color_manual(
+    values = host_colors,
+    breaks = host_levels
+  ) +
+  scale_x_continuous(
+    labels = scales::label_number(scale = 0.001, suffix = "k"),
+    breaks = scales::breaks_pretty(n = 3)
+  ) +
+  labs(
+    title = "Read-based rarefaction of retained Arthropoda ASVs",
+    subtitle = "One curve per web sample; all panels share axis scales",
+    x = "Subsampled retained reads",
+    y = "Expected retained ASVs",
+    caption = "Curves are conditional on prior QC and taxonomic filtering."
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    strip.text = element_text(face = "italic")
+  )
+
+rarefaction_plot
+```
+
+```{r hs_richness_read_depth, fig.width=12, fig.height=8}
+# ============================================================
+# PLOT 2A: OBSERVED RICHNESS VERSUS RETAINED READ DEPTH
+# ============================================================
+#
+# Diagnostic figure: differences in sequencing depth among samples.
+#
+# Each point is one biological web sample. This asks whether samples
+# with greater observed richness also have more retained reads.
+# The log10 x-axis makes low-depth samples easier to distinguish;
+# it changes the display, not the read counts or richness values.
+# This is descriptive, not a depth correction or a significance test.
+
+# ------------------------------------------------------------
+# DRAW THE FIGURE
+# ------------------------------------------------------------
+richness_read_depth_plot <- ggplot(
+  sample_alpha_diversity,
+  aes(
+    x = retained_reads,
+    y = observed_asvs,
+    color = tentative_species_id
+  )
+) +
+  geom_point(size = 2.8, alpha = 0.85) +
+  scale_x_log10(
+    labels = scales::label_comma()
+  ) +
+  scale_color_manual(
+    values = host_colors,
+    breaks = host_levels,
+    labels = host_labels
+  ) +
+  guides(
+    color = guide_legend(ncol = 2, byrow = TRUE)
+  ) +
+  labs(
+    title = "Observed ASV richness and retained read depth",
+    subtitle = "One point per web sample; logarithmic read-depth axis",
+    x = "Final retained reads (log10 scale)",
+    y = "Number of detected ASVs",
+    color = "Tentative host species",
+    caption = paste(
+      "Final depth is measured after all ASV and taxonomic filters.",
+      "The earlier sample-depth cutoff is not applied again.",
+      sep = "\n"
+    )
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "bottom",
+    plot.caption = element_text(hjust = 0)
+  )
+
+richness_read_depth_plot
+```
+
+
+```{r hs_sample_accumulation, fig.width=9, fig.height=6}
+# ============================================================
+# PLOT 3: SAMPLE ACCUMULATION CURVE
+# ============================================================
+#
+# Exploratory figure: pooled sample coverage.
+#
+# This asks how many distinct ASVs are expected when combining more
+# web samples. Its x-axis is the number of samples, unlike the
+# read-based rarefaction above. The exact method averages over
+# sample subsets; there is no arbitrary row-order effect. All
+# retained host groups are pooled in this whole-dataset curve. The
+# ribbon is plus/minus one conditional standard deviation, not a 95%
+# CI. This curve does not extrapolate beyond the observed sample
+# set. This is an exploratory coverage diagnostic, not a host-group
+# comparison.
+
+# ------------------------------------------------------------
+# CALCULATE EXPECTED SAMPLE ACCUMULATION
+# ------------------------------------------------------------
+accumulation_model <- vegan::specaccum(
+  community_matrix,
+  method = "exact",
+  conditioned = TRUE
+)
+
+# ------------------------------------------------------------
+# PREPARE THE ACCUMULATION PLOT TABLE
+# ------------------------------------------------------------
+accumulation_plot_data <- tibble(
+  number_of_samples = accumulation_model$sites,
+  expected_asvs = accumulation_model$richness,
+  sd_asvs = accumulation_model$sd
+)
+
+# ------------------------------------------------------------
+# DRAW THE FIGURE
+# ------------------------------------------------------------
+accumulation_plot <- ggplot(
+  accumulation_plot_data,
+  aes(x = number_of_samples, y = expected_asvs)
+) +
+  geom_ribbon(
+    aes(
+      ymin = pmax(0, expected_asvs - sd_asvs),
+      ymax = pmin(ncol(community_matrix), expected_asvs + sd_asvs)
+    ),
+    fill = "#257C9D",
+    alpha = 0.2
+  ) +
+  geom_line(
+    color = "#257C9D",
+    linewidth = 0.9
+  ) +
+  labs(
+    title = "Accumulation of retained ASVs across web samples",
+    subtitle = "All host groups pooled; exact expected accumulation",
+    x = "Number of web samples",
+    y = "Expected cumulative ASVs",
+    caption = "Ribbon: mean +/- 1 conditional SD, clipped to the possible ASV range."
+  ) +
+  theme_bw()
+
+accumulation_plot
+```
+
+```{r hs_group_accumulation, fig.width=12, fig.height=8}
+# ============================================================
+# PLOT 3A: SAMPLE ACCUMULATION WITHIN HOST GROUPS
+# ============================================================
+#
+# Exploratory figure: sampling coverage within each host group.
+#
+# Use the same exact method as the pooled curve, separately for each
+# host. Compare curves at the same number of samples: the endpoint
+# of a longer curve also reflects greater sampling effort.
+# Groups with one sample have one observed point, not a curve.
+# Ribbons show one conditional SD, not confidence intervals.
+#
+# ASVs detected in every sample within a group have constant presence.
+# This can trigger a zero-standard-deviation warning in specaccum().
+# vegan handles the undefined correlations internally; retain these ASVs.
+# ------------------------------------------------------------
+# CALCULATE EXPECTED ACCUMULATION FOR EACH HOST GROUP
+# ------------------------------------------------------------
+group_accumulation_data <- bind_rows(
+  lapply(host_levels, function(host) {
+
+    sample_ids <- analysis_sample_metadata$sample_id[
+      analysis_sample_metadata$tentative_species_id == host
+    ]
+    group_matrix <- community_matrix[sample_ids, , drop = FALSE]
+
+    if (length(sample_ids) == 1) {
+      group_curve <- tibble(
+        number_of_samples = 1,
+        expected_asvs = as.numeric(vegan::specnumber(group_matrix)),
+        sd_asvs = 0
+      )
+    } else {
+      group_model <- vegan::specaccum(
+        group_matrix,
+        method = "exact",
+        conditioned = TRUE
+      )
+      group_curve <- tibble(
+        number_of_samples = group_model$sites,
+        expected_asvs = group_model$richness,
+        sd_asvs = group_model$sd
+      )
+    }
+
+    group_curve %>%
+      mutate(
+        tentative_species_id = host,
+        group_n = length(sample_ids),
+        total_group_asvs = sum(colSums(group_matrix) > 0)
+      )
+  })
+) %>%
+  mutate(
+    tentative_species_id = factor(tentative_species_id, levels = host_levels)
+  )
+
+# ------------------------------------------------------------
+# DRAW THE FIGURE
+# ------------------------------------------------------------
+group_accumulation_plot <- ggplot(
+  group_accumulation_data,
+  aes(
+    x = number_of_samples,
+    y = expected_asvs,
+    color = tentative_species_id,
+    group = tentative_species_id
+  )
+) +
+  geom_ribbon(
+    data = group_accumulation_data %>% filter(group_n > 1),
+    aes(
+      ymin = pmax(0, expected_asvs - sd_asvs),
+      ymax = pmin(total_group_asvs, expected_asvs + sd_asvs),
+      fill = tentative_species_id
+    ),
+    color = NA,
+    alpha = 0.08,
+    show.legend = FALSE
+  ) +
+  geom_line(
+    data = group_accumulation_data %>% filter(group_n > 1),
+    linewidth = 0.9
+  ) +
+  geom_point(
+    data = group_accumulation_data %>% filter(group_n == 1),
+    size = 3
+  ) +
+  scale_color_manual(
+    values = host_colors,
+    breaks = host_levels,
+    labels = host_labels
+  ) +
+  scale_fill_manual(values = host_colors) +
+  guides(
+    color = guide_legend(ncol = 2, byrow = TRUE)
+  ) +
+  labs(
+    title = "Accumulation of retained ASVs within host groups",
+    subtitle = "Exact expected accumulation; no extrapolation",
+    x = "Number of web samples",
+    y = "Expected cumulative ASVs",
+    color = "Tentative host species",
+    caption = paste(
+      "Compare groups at equal sample counts. Singleton groups have one point.",
+      "Ribbons: mean +/- 1 conditional SD, clipped to each group's observed ASV range.",
+      sep = "\n"
+    )
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "bottom",
+    plot.caption = element_text(hjust = 0)
+  )
+
+group_accumulation_plot
+```
+
+
+### B. Alpha diversity
+
+```{r hs_sample_richness, fig.width=12, fig.height=10}
+# ============================================================
+# PLOT 4: OBSERVED ASV RICHNESS PER WEB SAMPLE
+# ============================================================
+#
+# Exploratory figure: individual-sample variation.
+#
+# Each bar represents a sample. Panels share a y-axis scale so their
+# heights can be compared. Richness is not standardized to a common
+# sequencing depth.
+
+# ------------------------------------------------------------
+# ORDER SAMPLES FOR DISPLAY
+# ------------------------------------------------------------
+sample_id_order <- sample_alpha_diversity %>%
+  arrange(
+    tentative_species_id,
+    desc(observed_asvs),
+    sample_id
+  ) %>%
+  pull(sample_id)
+
+sample_richness_bar_data <- sample_alpha_diversity %>%
+  mutate(
+    sample_id = factor(sample_id, levels = sample_id_order)
+  )
+
+# ------------------------------------------------------------
+# DRAW THE FIGURE
+# ------------------------------------------------------------
+sample_richness_bar_plot <- ggplot(
+  sample_richness_bar_data,
+  aes(x = sample_id, y = observed_asvs)
+) +
+  geom_col(
+    fill = "#257C9D",
+    width = 0.8
+  ) +
+  facet_wrap(
+    ~ tentative_species_id,
+    scales = "free_x",
+    ncol = 3
+  ) +
+  labs(
+    title = "Observed ASV richness in individual web samples",
+    subtitle = "Retained Arthropoda ASVs; one bar per sample",
+    x = "Web sample",
+    y = "Number of detected ASVs"
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5, size = 7),
+    panel.grid.major.x = element_blank(),
+    strip.text = element_text(face = "italic")
+  )
+
+sample_richness_bar_plot
+```
+
+```{r hs_group_richness, fig.width=10, fig.height=7}
+# ============================================================
+# PLOT 5: OBSERVED ASV RICHNESS BY HOST GROUP
+# ============================================================
+#
+# Main figure: host-group richness.
+#
+# This uses the same per-sample richness values as Figure 4. Each
+# dot is one sample; a box summarizes the median and interquartile
+# range. Groups with only one or two samples provide little
+# information about group variation. This is a descriptive comparison,
+# not a test of statistical significance.
+
+# ------------------------------------------------------------
+# DRAW THE FIGURE
+# ------------------------------------------------------------
+observed_richness_plot <- ggplot(
+  sample_alpha_diversity,
+  aes(x = tentative_species_id, y = observed_asvs)
+) +
+  geom_boxplot(fill = "grey90", outlier.shape = NA, width = 0.6) +
+  geom_point(
+    aes(color = tentative_species_id),
+    position = position_jitter(width = 0.12, height = 0, seed = 123),
+    size = 2.3,
+    alpha = 0.85
+  ) +
+  scale_color_manual(
+    values = host_colors,
+    breaks = host_levels
+  ) +
+  scale_x_discrete(
+    limits = rev(host_levels),
+    labels = host_labels
+  ) +
+  coord_flip() +
+  labs(
+    title = "Observed ASV richness by host-spider species",
+    subtitle = "Each point represents one web sample; no depth standardization",
+    x = "Tentative host-spider species",
+    y = "Number of detected ASVs"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    panel.grid.major.y = element_blank()
+  )
+
+observed_richness_plot
+```
+
+```{r hs_group_shannon, fig.width=10, fig.height=7}
+# ============================================================
+# PLOT 6: SHANNON DIVERSITY BY HOST GROUP
+# ============================================================
+#
+# Main figure: host-group ASV read diversity.
+#
+# Shannon reflects both ASV richness and the evenness of their read
+# proportions. It describes the sequenced ASV community, not the
+# evenness of animal counts.
+
+# ------------------------------------------------------------
+# DRAW THE FIGURE
+# ------------------------------------------------------------
+shannon_diversity_plot <- ggplot(
+  sample_alpha_diversity,
+  aes(x = tentative_species_id, y = shannon_index)
+) +
+  geom_boxplot(fill = "grey90", outlier.shape = NA, width = 0.6) +
+  geom_point(
+    aes(color = tentative_species_id),
+    position = position_jitter(width = 0.12, height = 0, seed = 123),
+    size = 2.3,
+    alpha = 0.85
+  ) +
+  scale_color_manual(
+    values = host_colors,
+    breaks = host_levels
+  ) +
+  scale_x_discrete(
+    limits = rev(host_levels),
+    labels = host_labels
+  ) +
+  coord_flip() +
+  labs(
+    title = "Shannon diversity by host-spider species",
+    subtitle = "Each point represents one web sample",
+    x = "Tentative host-spider species",
+    y = "Shannon diversity (natural log)"
+  ) +
+  theme_bw() +
+  theme(
+    legend.position = "none",
+    panel.grid.major.y = element_blank()
+  )
+
+shannon_diversity_plot
+```
+
+### C. Taxonomic composition
+
+```{r all_family_90, fig.width=11, fig.height=26}
+# Count retained ASVs without a family assignment.
+# These ASVs remain in mco_HS_final_tax but are not shown as named families.
+missing_family_asvs <- mco_HS_final_tax %>%
+  filter(is.na(Family) | trimws(Family) == "") %>%
+  summarise(n = n_distinct(query)) %>%
+  pull(n)
+
+# Count distinct ASVs within each family.
+family_counts_90 <- mco_HS_final_tax %>%
+  filter(!is.na(Family), trimws(Family) != "") %>%
+  group_by(Family) %>%
+  summarise(
+    Number_of_ASVs = n_distinct(query),
+    .groups = "drop")
+
+ggplot(
+  family_counts_90,
+  aes(
+    x = Number_of_ASVs,
+    y = reorder(Family, Number_of_ASVs)
+  )
+) +
+  geom_col(fill = "#257C9D") +
+  labs(
+    title = "HS MCO: distinct ASVs by family",
+    subtitle = "All retained classes; Best_Identity ≥90%",
+    x = "Number of distinct ASVs",
+    y = "Family",
+    caption = paste0(
+      "ASVs pooled across retained biological samples; not species counts or read abundance.\n",
+      missing_family_asvs,
+      " retained ASVs have no family assignment and are excluded from these bars."
+    )
+  ) +
+  theme_minimal() +
+  theme(
+    plot.caption = element_text(hjust = 0)
+  )
+```
+
+```{r hs_family_composition, fig.width=12, fig.height=10}
+# ============================================================
+# PLOT 7: FAMILY COMPOSITION BY HOST GROUP
+# ============================================================
+#
+# Main figure: taxonomic composition.
+#
+# Each stacked bar shows the mean number of detected ASVs per web sample
+# in a host group, split by Family. Every sample has equal weight within
+# its host group, including samples with zero detections of a Family.
+# These are ASV counts, not percentages, read counts or animal counts.
+
+# ------------------------------------------------------------
+# DEFINE THE DISPLAY SETTING
+# ------------------------------------------------------------
+# Top N determines which named families get separate colors; it is not
+# a QC threshold. Other named families are pooled only for display.
+# No ASVs are removed from the long table or community matrix.
+# number_of_top_families is defined in the initial settings.
+# Unassigned family remains separate from the ranked named families.
+# The same categories and colors are used in the read-composition plot.
+
+# ------------------------------------------------------------
+# COUNT DETECTED ASVS AND COMPLETE SAMPLE-BY-FAMILY ZEROS
+# ------------------------------------------------------------
+# Count each ASV once if detected (reads > 0) in the sample.
+# This summarizes detections; it does not filter the analysis dataset.
+sample_family_asvs <- mco_HS_plot_data %>%
+  mutate(
+    Family_plot = if_else(
+      is.na(Family) | str_squish(Family) == "",
+      "Unassigned family",
+      str_squish(Family)
+    )
+  ) %>%
+  group_by(sample_id, Family_plot) %>%
+  summarise(
+    number_of_asvs = n_distinct(query[reads > 0]),
+    .groups = "drop"
+  ) %>%
+  # Include every retained sample for every Family, even if the input long
+  # table stores only nonzero reads. For counts 5, 3 and absent, the mean
+  # must be (5 + 3 + 0) / 3, not (5 + 3) / 2.
+  tidyr::complete(
+    sample_id = analysis_sample_metadata$sample_id,
+    Family_plot,
+    fill = list(number_of_asvs = 0)
+  ) %>%
+  # Attach the one valid host identity for each sample AFTER completion.
+  # Completing sample and host independently would create invalid pairs.
+  left_join(
+    analysis_sample_metadata %>% select(sample_id, tentative_species_id),
+    by = "sample_id"
+  )
+
+# ------------------------------------------------------------
+# SELECT FAMILIES FOR INDIVIDUAL DISPLAY
+# ------------------------------------------------------------
+# Rank using all samples, including zeros, before pooling Families. Larger
+# host groups contribute more samples to this whole-dataset ranking.
+family_ranking <- sample_family_asvs %>%
+  filter(Family_plot != "Unassigned family") %>%
+  group_by(Family_plot) %>%
+  summarise(
+    mean_number_of_asvs = mean(number_of_asvs),
+    .groups = "drop"
+  ) %>%
+  arrange(
+    desc(mean_number_of_asvs),
+    Family_plot
+  )
+
+top_families <- family_ranking %>%
+  slice_head(n = number_of_top_families) %>%
+  pull(Family_plot)
+
+# ------------------------------------------------------------
+# POOL THE REMAINING FAMILIES
+# ------------------------------------------------------------
+# Pool within each sample first, so all samples still contribute one
+# value (possibly zero) per displayed category to the subsequent mean.
+sample_family_asvs_plot <- sample_family_asvs %>%
+  mutate(
+    Family_plot = case_when(
+      Family_plot %in% top_families ~ Family_plot,
+      Family_plot == "Unassigned family" ~ "Unassigned family",
+      TRUE ~ "Other families"
+    )
+  ) %>%
+  group_by(sample_id, tentative_species_id, Family_plot) %>%
+  summarise(
+    number_of_asvs = sum(number_of_asvs),
+    .groups = "drop"
+  )
+
+# Use the same display order and colors in both composition plots.
+# Grey distinguishes unresolved ASVs and the pooled remaining families.
+family_display_levels <- c(
+  top_families,
+  "Unassigned family",
+  "Other families"
+)
+
+family_colors <- c(
+  setNames(
+    grDevices::hcl.colors(max(3, length(top_families)), "Dark 3")[
+      seq_along(top_families)
+    ],
+    top_families
+  ),
+  "Unassigned family" = "#777777",
+  "Other families" = "#D9D9D9"
+)
+
+sample_family_asvs_plot <- sample_family_asvs_plot %>%
+  mutate(
+    Family_plot = factor(Family_plot, levels = family_display_levels)
+  )
+
+
+# ------------------------------------------------------------
+# CALCULATE MEAN ASV COUNTS WITHIN HOST GROUPS
+# ------------------------------------------------------------
+# The denominator for every Family is now the full host-group sample size.
+# The sum of a host's stacked segments equals its mean observed ASV richness.
+species_family_composition <- sample_family_asvs_plot %>%
+  group_by(tentative_species_id, Family_plot) %>%
+  summarise(
+    mean_number_of_asvs = mean(number_of_asvs),
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------
+# DRAW THE FIGURE
+# ------------------------------------------------------------
+family_composition_plot <- ggplot(
+  species_family_composition,
+  aes(x = tentative_species_id, y = mean_number_of_asvs, fill = Family_plot)
+) +
+  geom_col(width = 0.8, color = "white", linewidth = 0.15) +
+  scale_fill_manual(
+    values = family_colors,
+    limits = family_display_levels,
+    drop = FALSE
+  ) +
+  guides(
+    fill = guide_legend(ncol = 3, byrow = TRUE)
+  ) +
+  scale_x_discrete(
+    limits = host_levels,
+    labels = host_labels
+  ) +
+  labs(
+    title = "Web community composition by host-spider species",
+    subtitle = "Mean detected ASVs per web sample, grouped by Family",
+    x = "Tentative host-spider species",
+    y = "Mean ASVs per sample",
+    fill = "Family",
+    caption = paste0(
+      "Display setting: top ",
+      length(top_families),
+      " named families by mean ASV richness.\n",
+      "Unassigned family is separate; remaining named families are pooled as Other families."
+    )
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.x = element_blank(),
+    legend.position = "bottom",
+    legend.key.height = grid::unit(0.4, "cm"),
+    plot.caption = element_text(hjust = 0)
+  )
+
+family_composition_plot
+```
+
+```{r hs_family_read_composition, fig.width=12, fig.height=10}
+# ============================================================
+# PLOT 7A: FAMILY RELATIVE-READ COMPOSITION BY HOST GROUP
+# ============================================================
+#
+# Main figure: the proportion of retained reads assigned to each Family.
+#
+# First calculate each Family's percentage within each web sample.
+# Then average those percentages equally across all samples in a host
+# group, including zeros. Pooling reads before calculating percentages
+# would give deeper samples more weight and answer a different question.
+# These are sequence-read proportions, not animal counts or biomass.
+
+# ------------------------------------------------------------
+# CALCULATE FAMILY READ PERCENTAGES WITHIN SAMPLES
+# ------------------------------------------------------------
+sample_family_reads <- mco_HS_plot_data %>%
+  mutate(
+    Family_plot = if_else(
+      is.na(Family) | str_squish(Family) == "",
+      "Unassigned family",
+      str_squish(Family)
+    )
+  ) %>%
+  group_by(sample_id, Family_plot) %>%
+  summarise(
+    family_reads = sum(reads),
+    .groups = "drop"
+  ) %>%
+  tidyr::complete(
+    sample_id = analysis_sample_metadata$sample_id,
+    Family_plot,
+    fill = list(family_reads = 0)
+  ) %>%
+  group_by(sample_id) %>%
+  mutate(
+    relative_percent = 100 * family_reads / sum(family_reads)
+  ) %>%
+  ungroup()
+
+# Pool the same remaining named families within each sample.
+# Complete zero categories before joining host IDs, so each sample
+# contributes exactly one value to each displayed Family mean.
+sample_family_reads_plot <- sample_family_reads %>%
+  mutate(
+    Family_plot = case_when(
+      Family_plot %in% top_families ~ Family_plot,
+      Family_plot == "Unassigned family" ~ "Unassigned family",
+      TRUE ~ "Other families"
+    )
+  ) %>%
+  group_by(sample_id, Family_plot) %>%
+  summarise(
+    relative_percent = sum(relative_percent),
+    .groups = "drop"
+  ) %>%
+  tidyr::complete(
+    sample_id = analysis_sample_metadata$sample_id,
+    Family_plot = family_display_levels,
+    fill = list(relative_percent = 0)
+  ) %>%
+  left_join(
+    analysis_sample_metadata %>% select(sample_id, tentative_species_id),
+    by = "sample_id"
+  ) %>%
+  mutate(
+    Family_plot = factor(Family_plot, levels = family_display_levels)
+  )
+
+# ------------------------------------------------------------
+# AVERAGE SAMPLE PERCENTAGES WITHIN HOST GROUPS
+# ------------------------------------------------------------
+species_family_read_composition <- sample_family_reads_plot %>%
+  group_by(tentative_species_id, Family_plot) %>%
+  summarise(
+    mean_relative_percent = mean(relative_percent),
+    .groups = "drop"
+  )
+
+# ------------------------------------------------------------
+# DRAW THE FIGURE
+# ------------------------------------------------------------
+family_read_composition_plot <- ggplot(
+  species_family_read_composition,
+  aes(
+    x = tentative_species_id,
+    y = mean_relative_percent,
+    fill = Family_plot
+  )
+) +
+  geom_col(width = 0.8, color = "white", linewidth = 0.15) +
+  scale_fill_manual(
+    values = family_colors,
+    limits = family_display_levels,
+    drop = FALSE
+  ) +
+  guides(
+    fill = guide_legend(ncol = 3, byrow = TRUE)
+  ) +
+  scale_x_discrete(
+    limits = host_levels,
+    labels = host_labels
+  ) +
+  scale_y_continuous(
+    breaks = seq(0, 100, 25),
+    labels = function(x) paste0(x, "%"),
+    expand = expansion(mult = c(0, 0.02))
+  ) +
+  labs(
+    title = "Family read composition by host-spider species",
+    subtitle = "Equal-weight mean of sample-level percentages",
+    x = "Tentative host-spider species",
+    y = "Mean percentage of retained reads",
+    fill = "Family",
+    caption = paste(
+      "Each bar sums to 100%; categories and colors match the ASV-composition plot.",
+      "Read proportions do not directly estimate animal abundance or biomass.",
+      sep = "\n"
+    )
+  ) +
+  theme_bw() +
+  theme(
+    axis.text.x = element_text(angle = 45, hjust = 1),
+    panel.grid.major.x = element_blank(),
+    legend.position = "bottom",
+    legend.key.height = grid::unit(0.4, "cm"),
+    plot.caption = element_text(hjust = 0)
+  )
+
+family_read_composition_plot
+```
+
+```{r hs_sample_family_heatmap, fig.width=14, fig.height=max(8, 4 + 0.23 * nrow(community_matrix) + 0.12 * length(host_levels))}
+# ============================================================
+# PLOT 7B: FAMILY READ COMPOSITION OF INDIVIDUAL SAMPLES
+# ============================================================
+#
+# Exploratory figure: variation hidden by host-group averages.
+#
+# Rows are individual samples, grouped by host. Columns use the same
+# named families, Unassigned family and Other families as the bars.
+# Each cell is the Family's percentage of all retained reads in that
+# sample. Every row sums to 100%, including zero detections.
+#
+# All cells share one percentage scale. The square-root color mapping
+# makes low percentages more visible; values and legend labels remain
+# actual percentages. No row or column standardization is applied.
+
+# ------------------------------------------------------------
+# ORDER SAMPLES WITHIN HOST GROUPS
+# ------------------------------------------------------------
+# Natural ID order places hw2 before hw10 without changing host order.
+sample_family_order <- unlist(
+  lapply(host_levels, function(host) {
+    str_sort(
+      analysis_sample_metadata$sample_id[
+        analysis_sample_metadata$tentative_species_id == host
+      ],
+      numeric = TRUE
+    )
+  }),
+  use.names = FALSE
+)
+
+sample_family_heatmap_data <- sample_family_reads_plot %>%
+  mutate(
+    sample_id = factor(sample_id, levels = rev(sample_family_order))
+  )
+
+# ------------------------------------------------------------
+# DRAW THE FIGURE
+# ------------------------------------------------------------
+sample_family_heatmap <- ggplot(
+  sample_family_heatmap_data,
+  aes(x = Family_plot, y = sample_id, fill = relative_percent)
+) +
+  geom_tile() +
+  facet_grid(
+    tentative_species_id ~ .,
+    scales = "free_y",
+    space = "free_y",
+    switch = "y",
+    labeller = labeller(
+      tentative_species_id = as_labeller(host_labels)
+    )
+  ) +
+  scale_x_discrete(drop = FALSE) +
+  scale_fill_gradientn(
+    colors = c("#FAFAFA", "#C9DCEC", "#719DC3", "#285B87", "#102940"),
+    trans = "sqrt",
+    limits = c(0, 100),
+    breaks = c(0, 1, 5, 10, 25, 50, 100),
+    labels = function(x) paste0(x, "%")
+  ) +
+  guides(
+    fill = guide_colorbar(barheight = grid::unit(7, "cm"))
+  ) +
+  labs(
+    title = "Family read composition of individual web samples",
+    subtitle = "Samples grouped by host; shared percentage scale",
+    x = "Family",
+    y = "Web sample",
+    fill = "Retained reads",
+    caption = paste(
+      "Color uses a square-root scale; labels show actual percentages. Each row sums to 100%.",
+      "Unassigned family and Other families have the same definitions as in the composition bars.",
+      sep = "\n"
+    )
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank(),
+    axis.text.x = element_text(angle = 60, hjust = 1, size = 10),
+    axis.text.y = element_text(size = 10),
+    strip.placement = "outside",
+    strip.text.y.left = element_text(angle = 0, hjust = 1, size = 10),
+    panel.spacing.y = grid::unit(0.18, "cm"),
+    plot.caption = element_text(hjust = 0)
+  )
+
+sample_family_heatmap
+```
+
+```{r hs_family_detection_heatmap, fig.width=13, fig.height=13}
+# ============================================================
+# PLOT 7C: FAMILY DETECTION FREQUENCY BY HOST GROUP
+# ============================================================
+#
+# Main figure: how consistently each Family occurs within a host group.
+#
+# Detection means at least one retained ASV from that Family has reads
+# greater than zero. The percentage is detected samples divided by ALL
+# samples in the host group, including nondetections.
+#
+# Show every represented Family, not only the Top N composition set.
+# Unassigned family means any unresolved ASV was detected; it is not one
+# known shared taxon. A 100% value in an n=1 group represents one sample.
+
+# ------------------------------------------------------------
+# CALCULATE DETECTION FREQUENCIES
+# ------------------------------------------------------------
+family_detection_frequency <- sample_family_asvs %>%
+  group_by(tentative_species_id, Family_plot) %>%
+  summarise(
+    detected_samples = sum(number_of_asvs > 0),
+    group_samples = n(),
+    detection_percent = 100 * mean(number_of_asvs > 0),
+    .groups = "drop"
+  )
+
+# Keep the named-Family ranking from the composition plot, followed by
+# Unassigned family when present. Split long lists into blocks of 40
+# for readable labels; all blocks use the same host order and scale.
+full_family_order <- c(
+  family_ranking$Family_plot,
+  intersect("Unassigned family", sample_family_asvs$Family_plot)
+)
+
+family_detection_blocks <- split(
+  seq_along(full_family_order),
+  ceiling(seq_along(full_family_order) / 40)
+)
+
+# ------------------------------------------------------------
+# DRAW THE FIGURE
+# ------------------------------------------------------------
+for (family_indices in family_detection_blocks) {
+
+  families_here <- full_family_order[family_indices]
+
+  family_detection_plot_data <- family_detection_frequency %>%
+    filter(Family_plot %in% families_here) %>%
+    mutate(
+      Family_plot = factor(Family_plot, levels = rev(families_here))
+    )
+
+  family_detection_plot <- ggplot(
+    family_detection_plot_data,
+    aes(
+      x = tentative_species_id,
+      y = Family_plot,
+      fill = detection_percent
+    )
+  ) +
+    geom_tile(color = "white", linewidth = 0.15) +
+    scale_x_discrete(
+      limits = host_levels,
+      labels = host_labels,
+      drop = FALSE
+    ) +
+    scale_fill_gradientn(
+      colors = c("#FAFAFA", "#D1E5F0", "#67A9CF", "#2166AC", "#053061"),
+      limits = c(0, 100),
+      breaks = seq(0, 100, 25),
+      labels = function(x) paste0(x, "%")
+    ) +
+    labs(
+      title = "Family detection frequency by host group",
+      subtitle = paste0(
+        "Family categories ", min(family_indices), "-", max(family_indices),
+        " of ", length(full_family_order)
+      ),
+      x = "Tentative host-spider species",
+      y = "Family",
+      fill = "Samples detected",
+      caption = paste(
+        "Percentages use all samples in each host group, including nondetections.",
+        "Small groups provide limited evidence about typical occurrence; nondetection is not proof of absence.",
+        sep = "\n"
+      )
+    ) +
+    theme_bw() +
+    theme(
+      panel.grid = element_blank(),
+      axis.text.x = element_text(angle = 45, hjust = 1, size = 10),
+      axis.text.y = element_text(size = 10),
+      plot.caption = element_text(hjust = 0)
+    )
+
+  print(family_detection_plot)
+}
+```
+
+
+```{r hs_family_upset, fig.width=14, fig.height=8}
+# ============================================================
+# PLOT 7D: NAMED-FAMILY SHARING AMONG HOST GROUPS
+# ============================================================
+#
+# Exploratory figure: exact combinations of host groups sharing families.
+#
+# A Family belongs to a host-group set when at least one sample in
+# that group has a positive detection. Filled dots in a column show
+# the groups in one exact combination; unmarked groups are excluded.
+# The upper bar counts families with exactly that combination.
+# Left bars count all named families detected in each host group.
+#
+# Use all named families, not just the Top N display categories.
+# Omit Unassigned family only from this overlap calculation because
+# unresolved ASVs do not form one known shared taxon. Those ASVs remain
+# in the other analyses. Shared Family labels need not mean shared
+# species or ASVs. Group-only detections do not establish specificity.
+
+# ------------------------------------------------------------
+# BUILD HOST-GROUP PRESENCE SETS
+# ------------------------------------------------------------
+family_host_presence <- family_detection_frequency %>%
+  filter(Family_plot != "Unassigned family") %>%
+  transmute(
+    Family_plot,
+    tentative_species_id,
+    present = detected_samples > 0
+  ) %>%
+  pivot_wider(
+    names_from = tentative_species_id,
+    values_from = present,
+    values_fill = FALSE
+  ) %>%
+  select(Family_plot, all_of(host_levels))
+
+presence_matrix <- family_host_presence %>%
+  select(-Family_plot) %>%
+  as.matrix()
+
+# Each binary pattern identifies one exact combination of host groups.
+# Families are counted once; intersection counts sum to all named families.
+family_patterns <- apply(
+  presence_matrix,
+  1,
+  function(x) paste(as.integer(x), collapse = "")
+)
+
+upset_intersections <- tibble(
+  Family_plot = family_host_presence$Family_plot,
+  pattern = family_patterns
+) %>%
+  group_by(pattern) %>%
+  summarise(
+    number_of_families = n(),
+    families = paste(sort(Family_plot), collapse = ", "),
+    .groups = "drop"
+  ) %>%
+  arrange(desc(number_of_families), pattern) %>%
+  mutate(intersection_id = row_number())
+
+upset_membership <- do.call(
+  rbind,
+  strsplit(upset_intersections$pattern, "")
+) == "1"
+
+upset_set_sizes <- tibble(
+  tentative_species_id = host_levels,
+  host_position = rev(seq_along(host_levels)),
+  number_of_families = as.numeric(colSums(presence_matrix))
+)
+
+# Show every observed combination in consecutive blocks of at most 20.
+# Host labels, sample sizes and count scales stay the same in every block.
+upset_blocks <- split(
+  seq_len(nrow(upset_intersections)),
+  ceiling(seq_len(nrow(upset_intersections)) / 20)
+)
+
+# ------------------------------------------------------------
+# DRAW THE FIGURE
+# ------------------------------------------------------------
+for (intersection_indices in upset_blocks) {
+
+  upset_bar_data <- upset_intersections[intersection_indices, ] %>%
+    mutate(column_position = row_number())
+
+  upset_matrix_data <- tidyr::expand_grid(
+    column_position = seq_along(intersection_indices),
+    host_index = seq_along(host_levels)
+  ) %>%
+    mutate(
+      host_position = length(host_levels) + 1 - host_index,
+      present = upset_membership[
+        cbind(intersection_indices[column_position], host_index)
+      ]
+    )
+
+  upset_lines <- upset_matrix_data %>%
+    filter(present) %>%
+    group_by(column_position) %>%
+    summarise(
+      first_host = min(host_position),
+      last_host = max(host_position),
+      .groups = "drop"
+    )
+
+  # Upper bars align with the exact-combination columns below.
+  upset_bar_plot <- ggplot(
+    upset_bar_data,
+    aes(x = column_position, y = number_of_families)
+  ) +
+    geom_col(fill = "#257C9D", width = 0.7) +
+    geom_text(aes(label = number_of_families), vjust = -0.3, size = 3.5) +
+    scale_x_continuous(
+      limits = c(0.5, nrow(upset_bar_data) + 0.5),
+      expand = expansion(mult = 0),
+      breaks = NULL
+    ) +
+    scale_y_continuous(
+      limits = c(0, max(upset_intersections$number_of_families) * 1.2),
+      breaks = scales::breaks_pretty(n = 4),
+      expand = expansion(mult = c(0, 0.02))
+    ) +
+    labs(x = NULL, y = "Named families") +
+    theme_bw() +
+    theme(panel.grid.major.x = element_blank())
+
+  # The left bars show total named-Family detections for each host set.
+  upset_set_plot <- ggplot(
+    upset_set_sizes,
+    aes(x = number_of_families, y = host_position)
+  ) +
+    geom_col(
+      aes(fill = tentative_species_id),
+      orientation = "y",
+      width = 0.6
+    ) +
+    geom_text(aes(label = number_of_families), hjust = -0.2, size = 3.5) +
+    scale_fill_manual(values = host_colors) +
+    scale_x_continuous(
+      expand = expansion(mult = c(0, 0.18)),
+      breaks = scales::breaks_pretty(n = 3)
+    ) +
+    scale_y_continuous(
+      limits = c(0.5, length(host_levels) + 0.5),
+      breaks = rev(seq_along(host_levels)),
+      labels = unname(host_labels),
+      expand = expansion(mult = 0)
+    ) +
+    labs(x = "Named families detected", y = NULL) +
+    theme_bw() +
+    theme(
+      legend.position = "none",
+      panel.grid.major.y = element_blank(),
+      axis.text.y = element_text(size = 10)
+    )
+
+  # Pale dots are unmarked groups; dark connected dots form one combination.
+  upset_matrix_plot <- ggplot(
+    upset_matrix_data,
+    aes(x = column_position, y = host_position)
+  ) +
+    geom_point(color = "grey85", size = 2.4) +
+    geom_segment(
+      data = upset_lines,
+      aes(
+        x = column_position,
+        xend = column_position,
+        y = first_host,
+        yend = last_host
+      ),
+      inherit.aes = FALSE,
+      linewidth = 0.6
+    ) +
+    geom_point(
+      data = upset_matrix_data %>% filter(present),
+      color = "#172C3C",
+      size = 2.7
+    ) +
+    scale_x_continuous(
+      limits = c(0.5, nrow(upset_bar_data) + 0.5),
+      breaks = upset_bar_data$column_position,
+      labels = upset_bar_data$intersection_id,
+      expand = expansion(mult = 0)
+    ) +
+    scale_y_continuous(
+      limits = c(0.5, length(host_levels) + 0.5),
+      breaks = seq_along(host_levels),
+      labels = NULL,
+      expand = expansion(mult = 0)
+    ) +
+    labs(x = "Observed combination", y = NULL) +
+    theme_bw() +
+    theme(panel.grid = element_blank())
+
+  # Align the three ggplot panels using grid, which is included with R.
+  # Shared widths align upper bars with dots; shared heights align host rows.
+  bar_grob <- ggplotGrob(upset_bar_plot)
+  set_grob <- ggplotGrob(upset_set_plot)
+  matrix_grob <- ggplotGrob(upset_matrix_plot)
+  shared_widths <- grid::unit.pmax(bar_grob$widths, matrix_grob$widths)
+  bar_grob$widths <- shared_widths
+  matrix_grob$widths <- shared_widths
+  shared_heights <- grid::unit.pmax(set_grob$heights, matrix_grob$heights)
+  set_grob$heights <- shared_heights
+  matrix_grob$heights <- shared_heights
+
+  grid::grid.newpage()
+  grid::pushViewport(grid::viewport(
+    layout = grid::grid.layout(
+      nrow = 4,
+      ncol = 2,
+      widths = grid::unit(c(5.5, 8.5), "null"),
+      heights = grid::unit(c(0.65, 2.0, 4.5, 0.65), "null")
+    )
+  ))
+
+  grid::pushViewport(grid::viewport(layout.pos.row = 1, layout.pos.col = 1:2))
+  grid::grid.text(
+    "Observed Family sharing across host groups",
+    y = 0.75,
+    gp = grid::gpar(fontsize = 15, fontface = "bold")
+  )
+  grid::grid.text(
+    paste0(
+      "Combinations ", min(intersection_indices), "-", max(intersection_indices),
+      " of ", nrow(upset_intersections), "; all named families included"
+    ),
+    y = 0.22,
+    gp = grid::gpar(fontsize = 11)
+  )
+  grid::popViewport()
+
+  grid::pushViewport(grid::viewport(layout.pos.row = 2, layout.pos.col = 2))
+  grid::grid.draw(bar_grob)
+  grid::popViewport()
+
+  grid::pushViewport(grid::viewport(layout.pos.row = 3, layout.pos.col = 1))
+  grid::grid.draw(set_grob)
+  grid::popViewport()
+
+  grid::pushViewport(grid::viewport(layout.pos.row = 3, layout.pos.col = 2))
+  grid::grid.draw(matrix_grob)
+  grid::popViewport()
+
+  grid::pushViewport(grid::viewport(layout.pos.row = 4, layout.pos.col = 1:2))
+  grid::grid.text(
+    paste(
+      "Each column is an exact observed host-group combination; the bar counts named families.",
+      "Sampling is unequal. Group-only detections do not establish host specificity.",
+      sep = "\n"
+    ),
+    gp = grid::gpar(fontsize = 10)
+  )
+  grid::popViewport(2)
+}
+```
+
+
+### D. Beta diversity
+
+```{r hs_nmds, fig.width=11, fig.height=7}
+# ============================================================
+# PLOT 8: NMDS OF WEB-COMMUNITY COMPOSITION
+# ============================================================
+#
+# Main figure: community-composition differences.
+#
+# The existing method is retained: sample-relative ASV reads,
+# Bray-Curtis dissimilarity and a two-dimensional NMDS. Each point
+# is a web sample. Nearby points represent more similar
+# compositions, approximately; inspect stress and convergence before
+# interpreting the layout. NMDS axes have no direct biological meaning
+# and are not explained-variance percentages. Visual separation is not a
+# significance test.
+
+# ------------------------------------------------------------
+# CALCULATE RELATIVE READS AND BRAY-CURTIS DISTANCES
+# ------------------------------------------------------------
+nmds_relative_matrix <- vegan::decostand(
+  community_matrix,
+  method = "total"
+)
+bray_curtis_distance <- vegan::vegdist(
+  nmds_relative_matrix,
+  method = "bray"
+)
+
+# ------------------------------------------------------------
+# FIT THE TWO-DIMENSIONAL NMDS
+# ------------------------------------------------------------
+set.seed(analysis_seed)
+# Disable automatic half-change scaling for this dataset.
+# This changes coordinate scaling, not stress or input dissimilarities.
+mco_HS_nmds <- vegan::metaMDS(
+  bray_curtis_distance,
+  k = 2,
+  trymax = nmds_trymax,
+  halfchange = FALSE,
+  trace = FALSE
+)
+
+# A distance matrix is supplied above, so metaMDS cannot apply another
+# transformation to the original counts. Print fitting diagnostics once.
+
+# "Species: scores missing" is expected with a distance-matrix input.
+# ASV ordination scores are unavailable; this does not indicate lost data.
+
+mco_HS_nmds
+
+# ------------------------------------------------------------
+# EXTRACT SAMPLE COORDINATES AND ATTACH HOST GROUPS
+# ------------------------------------------------------------
+nmds_scores <- vegan::scores(mco_HS_nmds, display = "sites") %>%
+  as.data.frame() %>%
+  rownames_to_column(var = "sample_id") %>%
+  left_join(analysis_sample_metadata, by = "sample_id")
+
+# ------------------------------------------------------------
+# SELECT GROUPS WITH ENOUGH SAMPLES FOR ELLIPSES
+# ------------------------------------------------------------
+# Ellipses are descriptive and do not test group differences.
+# Require at least four samples; this only controls the ellipse layer.
+# All samples, including those in sparse groups, remain visible as points.
+ellipse_species <- host_sample_counts %>%
+  filter(number_of_samples >= 4) %>%
+  pull(tentative_species_id)
+
+# ------------------------------------------------------------
+# DRAW THE FIGURE
+# ------------------------------------------------------------
+nmds_plot <- ggplot(
+  nmds_scores,
+  aes(x = NMDS1, y = NMDS2, color = tentative_species_id)
+) +
+  stat_ellipse(
+    data = nmds_scores %>%
+      filter(tentative_species_id %in% ellipse_species),
+    aes(group = tentative_species_id),
+    type = "t",
+    level = 0.95,
+    linewidth = 0.6,
+    show.legend = FALSE
+  ) +
+  geom_point(size = 2.8, alpha = 0.85) +
+  scale_color_manual(
+    values = host_colors,
+    breaks = host_levels,
+    labels = host_labels
+  ) +
+  coord_equal() +
+  labs(
+    title = "NMDS of spider-web community composition",
+    subtitle = paste0(
+      "Relative reads; Bray-Curtis; stress = ",
+      round(mco_HS_nmds$stress, 3)
+    ),
+    x = "NMDS1",
+    y = "NMDS2",
+    color = "Tentative host species",
+    caption = "Descriptive ellipses shown only for groups with at least four samples."
+  ) +
+  theme_bw() +
+  theme(
+    panel.grid = element_blank()
+  )
+
+nmds_plot
+```
+
+```{r hs_nmds_diagnostics}
+# ============================================================
+# NMDS FIT DIAGNOSTICS: TWO VERSUS THREE DIMENSIONS
+# ============================================================
+#
+# Compare the same Bray-Curtis distances in two and three dimensions.
+# More dimensions can reduce distortion. A lower 3D stress is not a
+# significance test, and the first two axes of a 3D fit are not a
+# replacement for the two-dimensional plot above.
+
+# ------------------------------------------------------------
+# FIT THE THREE-DIMENSIONAL DIAGNOSTIC
+# ------------------------------------------------------------
+set.seed(analysis_seed)
+mco_HS_nmds_3d <- vegan::metaMDS(
+  bray_curtis_distance,
+  k = 3,
+  trymax = nmds_trymax,
+  trace = FALSE
+)
+
+# ------------------------------------------------------------
+# SUMMARIZE FIT AND STOPPING INFORMATION
+# ------------------------------------------------------------
+# Repeating the best solution supports stability across random starts;
+# it does not prove that a global optimum was found. The stopping
+# reason and iteration count below describe the winning start only.
+# Inspect them before changing the per-start iteration limit (maxit).
+# Increasing random starts does not guarantee an adequate fit.
+nmds_models <- list(
+  "2D" = mco_HS_nmds,
+  "3D" = mco_HS_nmds_3d
+)
+
+nmds_stop_reasons <- c(
+  "Iteration limit reached",
+  "Stress near zero",
+  "Stress nearly unchanged",
+  "Gradient scale near zero"
+)
+
+nmds_fit_summary <- bind_rows(
+  lapply(names(nmds_models), function(dimension) {
+    fit <- nmds_models[[dimension]]
+    tibble(
+      Dimensions = dimension,
+      Stress = fit$stress,
+      Starts = fit$tries,
+      Repeated = if_else(fit$converged > 0, "Yes", "No"),
+      Iterations = fit$iters,
+      Stop_reason = nmds_stop_reasons[fit$icause]
+    )
+  })
+)
+
+knitr::kable(
+  nmds_fit_summary,
+  digits = 4,
+  col.names = c("Dimensions", "Stress", "Starts", "Best repeated", "Iterations", "Stop reason")
+)
+```
+
+```{r hs_nmds_shepard, fig.width=13, fig.height=6}
+# ============================================================
+# PLOT 8A: NMDS SHEPARD DIAGNOSTICS
+# ============================================================
+#
+# The x-axis shows observed Bray-Curtis dissimilarity. The y-axis
+# shows distance in the fitted ordination. Scatter around the fitted
+# monotone line indicates distortion; inspect this together with stress.
+
+# ------------------------------------------------------------
+# DRAW THE FIGURE
+# ------------------------------------------------------------
+# stressplot supplies its own x-axis and y-axis titles. Do not pass
+# xlab or ylab again, because duplicate arguments stop knitting.
+previous_par <- par(
+  mfrow = c(1, 2),
+  mar = c(4.5, 4.8, 3.5, 1)
+)
+
+for (dimension in names(nmds_models)) {
+  vegan::stressplot(
+    nmds_models[[dimension]],
+    pch = 16,
+    p.col = "#257C9D",
+    cex = 0.55
+  )
+  title(main = paste(dimension, "NMDS Shepard plot"))
+}
+
+par(previous_par)
+```
+
+
+```{r hs_permanova, results='asis'}
+# ============================================================
+# OVERALL PERMANOVA: COMMUNITY DIFFERENCES AMONG HOST GROUPS
+# ============================================================
+#
+# Test whether ASV composition is associated with host group using
+# sample-relative reads and Bray-Curtis dissimilarity. The test uses
+# the original distances, not the two-dimensional NMDS coordinates.
+# R2 measures the fraction of distance-based variation associated
+# with host group; the permutation p-value assesses the overall test.
+#
+# Each biological sample, after A/B/C merging, is one independent unit.
+# Unrestricted permutations assume independent biological samples.
+# Available HS location/date fields are constant. For paired or blocked
+# experiments, adapt the permutation design before reusing this test.
+
+# ------------------------------------------------------------
+# SELECT THE APPROVED FORMAL-TEST GROUPS
+# ------------------------------------------------------------
+# Use groups with at least two retained samples. Singleton groups remain
+# in all descriptive analyses. This is the project's analysis rule;
+# the remaining n=2-4 groups still provide limited, exploratory evidence.
+eligible_hosts <- host_sample_counts %>%
+  filter(number_of_samples >= min_group_samples) %>%
+  pull(tentative_species_id) %>%
+  as.character()
+
+test_metadata <- analysis_sample_metadata %>%
+  filter(tentative_species_id %in% eligible_hosts) %>%
+  mutate(
+    tentative_species_id = droplevels(tentative_species_id)
+  )
+
+can_run_group_tests <- length(eligible_hosts) >= 2
+omnibus_p <- NA_real_
+
+# ------------------------------------------------------------
+# FIT AND REPORT THE OVERALL MODEL
+# ------------------------------------------------------------
+if (can_run_group_tests) {
+
+  # Match matrix rows to metadata by ID; keep every ASV column.
+  test_relative_matrix <- nmds_relative_matrix[
+    test_metadata$sample_id, , drop = FALSE
+  ]
+  test_bray <- vegan::vegdist(
+    test_relative_matrix,
+    method = "bray"
+  )
+
+  # Reuse these biological-sample permutations for the dispersion test.
+  set.seed(analysis_seed)
+  test_permutations <- permute::shuffleSet(
+    nrow(test_metadata),
+    nset = n_permutations,
+    control = permute::how(nperm = n_permutations)
+  )
+
+  permanova_model <- vegan::adonis2(
+    test_bray ~ tentative_species_id,
+    data = test_metadata,
+    permutations = test_permutations
+  )
+  omnibus_p <- as.numeric(permanova_model[1, "Pr(>F)"])
+
+  print(knitr::kable(
+    as.data.frame(permanova_model),
+    digits = 4,
+    caption = paste0(
+      "Overall PERMANOVA: ", nrow(test_metadata), " samples in ",
+      length(eligible_hosts), " host groups; ", nrow(test_permutations),
+      " permutations; seed ", analysis_seed, "."
+    )
+  ))
+
+} else {
+  cat("Formal group tests require at least two host groups with repeated samples.\n")
+}
+```
+
+
+```{r hs_beta_dispersion, fig.width=10, fig.height=7}
+# ============================================================
+# PLOT 9: WITHIN-GROUP BETA DISPERSION
+# ============================================================
+#
+# Main figure: within-group heterogeneity.
+#
+# This shows distances to each host group's spatial median in the
+# principal coordinate space of the Bray-Curtis distances, not
+# distances measured on the two-dimensional NMDS plot. Larger values
+# indicate greater within-group heterogeneity. Here type = "median", so
+# these are distances to spatial medians, not centroids.
+# Use the same eligible samples as the overall PERMANOVA, with the
+# small-sample bias adjustment. Singleton groups remain descriptive.
+# The permutation test asks whether within-group dispersion differs.
+# Interpret it alongside PERMANOVA: unequal dispersion can contribute
+# to a significant PERMANOVA, especially with unequal group sizes.
+
+if (can_run_group_tests) {
+
+  # ------------------------------------------------------------
+  # ALIGN HOST LABELS WITH THE DISTANCE MATRIX
+  # ------------------------------------------------------------
+  # test_bray was constructed in test_metadata sample-ID order above.
+  ordered_nmds_metadata <- test_metadata
+
+  # ------------------------------------------------------------
+  # CALCULATE DISTANCES TO GROUP SPATIAL MEDIANS
+  # ------------------------------------------------------------
+  dispersion_model <- vegan::betadisper(
+    test_bray,
+    group = ordered_nmds_metadata$tentative_species_id,
+    type = "median",
+    bias.adjust = TRUE
+  )
+
+  # ------------------------------------------------------------
+  # PREPARE THE DISPERSION PLOT TABLE
+  # ------------------------------------------------------------
+  dispersion_plot_data <- tibble(
+    sample_id = names(dispersion_model$distances),
+    distance_to_median = as.numeric(dispersion_model$distances)
+  ) %>%
+    left_join(test_metadata, by = "sample_id")
+
+  # ------------------------------------------------------------
+  # DRAW THE FIGURE
+  # ------------------------------------------------------------
+  dispersion_plot <- ggplot(
+    dispersion_plot_data,
+    aes(x = tentative_species_id, y = distance_to_median)
+  ) +
+    geom_boxplot(fill = "grey90", outlier.shape = NA, width = 0.6) +
+    geom_point(
+      aes(color = tentative_species_id),
+      position = position_jitter(width = 0.12, height = 0, seed = 123),
+      size = 2.3,
+      alpha = 0.85
+    ) +
+    scale_color_manual(
+      values = host_colors,
+      breaks = eligible_hosts
+    ) +
+    scale_x_discrete(
+      limits = rev(eligible_hosts),
+      labels = host_labels
+    ) +
+    coord_flip() +
+    labs(
+      title = "Within-group dispersion by host-spider species",
+      subtitle = "Bray-Curtis; eligible groups; small-sample bias adjustment",
+      x = "Tentative host-spider species",
+      y = "Bias-adjusted distance to group spatial median",
+      caption = "The plot and permutation test use the same eligible samples; singleton groups remain descriptive."
+    ) +
+    theme_bw() +
+    theme(
+      legend.position = "none",
+      panel.grid.major.y = element_blank()
+    )
+
+  print(dispersion_plot)
+}
+```
+
+```{r hs_dispersion_test, results='asis'}
+# ============================================================
+# PERMUTATION TEST OF WITHIN-GROUP DISPERSION
+# ============================================================
+#
+# Spatial medians and bias.adjust = TRUE match the preceding plot.
+# The adjustment scales distances by sqrt(n / (n - 1)) within each
+# group. It reduces small-sample bias but does not overcome low power.
+# No square-root or additive correction is applied to Bray-Curtis;
+# any distance warnings remain visible for review.
+
+if (can_run_group_tests) {
+
+  dispersion_test <- vegan::permutest(
+    dispersion_model,
+    permutations = test_permutations,
+    pairwise = FALSE
+  )
+
+  print(knitr::kable(
+    as.data.frame(dispersion_test$tab),
+    digits = 4,
+    caption = "Permutation test of differences in within-group dispersion."
+  ))
+}
+
+# A significant dispersion test indicates differences in within-group
+# variability. If PERMANOVA is also significant, do not attribute the
+# result solely to differences in group location. A nonsignificant
+# dispersion result does not prove equality, especially in small groups.
+# These tests describe associations, not causal host preferences.
+```
+
+
+```{r hs_pairwise_permanova, results='asis'}
+# ============================================================
+# CONDITIONAL PAIRWISE PERMANOVA
+# ============================================================
+#
+# Run every pair among the eligible host groups only if the overall
+# PERMANOVA p-value is below test_alpha. Use the same relative-read
+# Bray-Curtis distances, and adjust p-values by Holm's method across
+# the complete set of comparisons. Small groups remain exploratory.
+
+# ------------------------------------------------------------
+# PREPARE PERMUTATIONS FOR A TWO-GROUP COMPARISON
+# ------------------------------------------------------------
+# For two groups, choose(n, n_a) gives the number of unique assignments
+# of samples to the first group. Enumerate all assignments when feasible;
+# otherwise use the configured number of random permutations.
+#
+# Rows must be ordered with group A first and group B second. Exclude
+# the observed assignment from the permutation matrix because adonis2
+# includes the observed statistic when calculating its p-value.
+# Reordering samples within a group adds no new test statistic.
+# This enumeration assumes unrestricted, independent biological samples.
+make_pair_permutations <- function(n, n_a, requested) {
+
+  possible <- choose(n, n_a)
+
+  if (is.finite(possible) && possible <= requested + 1) {
+
+    allocations <- utils::combn(
+      seq_len(n),
+      n_a,
+      simplify = FALSE
+    )
+    observed <- seq_len(n_a)
+    allocations <- Filter(
+      function(x) !identical(as.integer(x), observed),
+      allocations
+    )
+
+    indices <- do.call(
+      rbind,
+      lapply(allocations, function(x) {
+        c(x, setdiff(seq_len(n), x))
+      })
+    )
+    storage.mode(indices) <- "integer"
+
+    return(list(indices = indices, method = "Exact"))
+  }
+
+  indices <- permute::shuffleSet(
+    n,
+    nset = requested,
+    control = permute::how(nperm = requested)
+  )
+
+  list(indices = indices, method = "Random")
+}
+
+# ------------------------------------------------------------
+# RUN THE APPROVED CONDITIONAL COMPARISONS
+# ------------------------------------------------------------
+run_pairwise <- can_run_group_tests &&
+  is.finite(omnibus_p) && omnibus_p < test_alpha
+
+if (run_pairwise) {
+
+  host_pairs <- utils::combn(eligible_hosts, 2, simplify = FALSE)
+  full_bray_matrix <- as.matrix(bray_curtis_distance)
+  set.seed(analysis_seed)
+
+  pairwise_results <- bind_rows(
+    lapply(host_pairs, function(pair) {
+
+      pair_metadata <- test_metadata %>%
+        filter(tentative_species_id %in% pair) %>%
+        mutate(
+          tentative_species_id = factor(
+            as.character(tentative_species_id),
+            levels = pair
+          )
+        ) %>%
+        arrange(tentative_species_id, sample_id)
+
+      n_a <- sum(pair_metadata$tentative_species_id == pair[1])
+      n_b <- sum(pair_metadata$tentative_species_id == pair[2])
+      sample_ids <- pair_metadata$sample_id
+
+      pair_bray <- as.dist(
+        full_bray_matrix[sample_ids, sample_ids, drop = FALSE]
+      )
+      pair_permutations <- make_pair_permutations(
+        length(sample_ids),
+        n_a,
+        n_permutations
+      )
+
+      pair_model <- vegan::adonis2(
+        pair_bray ~ tentative_species_id,
+        data = pair_metadata,
+        permutations = pair_permutations$indices
+      )
+
+      tibble(
+        Host_A = pair[1],
+        Host_B = pair[2],
+        n_A = n_a,
+        n_B = n_b,
+        R2 = as.numeric(pair_model[1, "R2"]),
+        pseudo_F = as.numeric(pair_model[1, "F"]),
+        p_raw = as.numeric(pair_model[1, "Pr(>F)"]),
+        permutation_rows = nrow(pair_permutations$indices),
+        method = pair_permutations$method
+      )
+    })
+  ) %>%
+    mutate(
+      p_Holm = p.adjust(p_raw, method = "holm", n = length(host_pairs))
+    ) %>%
+    select(
+      Host_A, Host_B, n_A, n_B, R2, pseudo_F,
+      p_raw, p_Holm, permutation_rows, method
+    )
+
+  # Report every eligible pair, not only comparisons with small p-values.
+  # Exact p-values can be coarse when only a few assignments are possible.
+  print(knitr::kable(
+    pairwise_results,
+    digits = 4,
+    col.names = c(
+      "Host A", "Host B", "n A", "n B", "R2", "Pseudo-F",
+      "Raw p", "Holm p", "Permutations", "Method"
+    ),
+    caption = paste0(
+      "All ", nrow(pairwise_results),
+      " eligible host-pair comparisons; Holm correction across the full set."
+    )
+  ))
+
+} else if (can_run_group_tests && is.finite(omnibus_p)) {
+  cat("Pairwise PERMANOVA was not run because the overall test did not pass the significance threshold.\n")
+} else {
+  cat("Pairwise PERMANOVA was not run because a valid overall comparison was unavailable.\n")
+}
+
+# Read pairwise results together with the overall dispersion test.
+# Small and unequal groups limit inference; a significant comparison
+# does not establish host preference or explain the biological mechanism.
+```
